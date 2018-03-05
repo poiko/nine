@@ -72,25 +72,63 @@ impl NES {
         }
     }
     
-    fn run(&self, program: Vec<u8>) {
+    fn run(&self, program: ROM) {
     }
 }
 
+const PRG_BANK_SIZE: u32 = 16384;
+const CHR_BANK_SIZE: u32 = 8192;
+
+#[derive(Default)]
 struct ROM {
-    
+    num_prg_banks: u32,
+    num_chr_banks: u32,
+    num_ram_banks: u32,
+    mapper_id: u32,
+
+    prg_rom: Vec<u8>,
+    chr_rom: Vec<u8>
 }
 
-fn load_nes_file<P: AsRef<Path>>(path: P) -> Result<Vec<u8>, NineError> {
+impl ROM {
+    fn new() -> ROM {
+        ROM::default()
+    }
+}
+
+fn load_nes_file<P: AsRef<Path>>(path: P) -> Result<ROM, NineError> {
     let mut file = try!(File::open(&path));
     let mut file_buf = Vec::new();
     try!(file.read_to_end(&mut file_buf));
-    Ok(file_buf)
+
+    assert_eq!(&file_buf[..4], &[0x4e, 0x45, 0x53, 0x1a], "Not a valid NES file.");
+
+    let mut rom = ROM::new();
+    rom.num_prg_banks = file_buf[4] as u32;
+    rom.num_chr_banks = file_buf[5] as u32;
+    // TODO: handle this
+    let ctrl1 = file_buf[6];
+    let ctrl2 = file_buf[7];
+    rom.num_ram_banks = file_buf[8] as u32;
+
+    let prg_rom_size = (rom.num_prg_banks * PRG_BANK_SIZE) as usize;
+    rom.prg_rom = file_buf[272..prg_rom_size].to_vec();
+
+    Ok(rom)
 }
 
 fn main() {
     let nes = NES::new();
-    match load_nes_file("roms/zelda.nes") {
-        Ok(rom) => nes.run(rom),
+    let file_name = "roms/zelda.nes";
+    println!("Loading ROM file {}:", file_name);
+    match load_nes_file(file_name) {
+        Ok(rom) => {
+            println!("    number of PRGROM banks: {}", rom.num_prg_banks);
+            println!("    number of CHRROM banks: {}", rom.num_chr_banks);
+            println!("    number of RAM banks: {}", rom.num_ram_banks);
+            println!("    mapper id: {}", rom.mapper_id);
+            nes.run(rom);
+        },
         Err(err) => println!("Error: {}", err)
     }
 }
