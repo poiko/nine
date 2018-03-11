@@ -1,8 +1,6 @@
 extern crate byteorder;
 
 mod nes;
-mod cpu;
-mod ppu;
 
 fn main() {
     let mut nes = nes::NES::new();

@@ -3,8 +3,8 @@ use std::io::{self, Read};
 use std::path::Path;
 use std::fmt;
 
-use super::cpu;
-use super::ppu;
+mod cpu;
+mod ppu;
 
 #[derive(Debug)]
 pub enum NESError {
@@ -68,14 +68,12 @@ pub fn load_nes_file<P: AsRef<Path>>(path: P) -> Result<ROM, NESError> {
 #[derive(Default)]
 pub struct NES {
     cpu: cpu::CPU,
-    ppu: ppu::PPU
 }
 
 impl NES {
     pub fn new() -> NES {
         NES {
             cpu: cpu::CPU::new(),
-            ppu: ppu::PPU::new()
         }
     }
 
@@ -84,7 +82,7 @@ impl NES {
         self.cpu.reset();
         
         loop {
-            self.cpu.run_instruction(&self.ppu);
+            self.cpu.run_step();
         }
     }
 }
