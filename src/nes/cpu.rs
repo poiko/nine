@@ -67,6 +67,18 @@ impl CPU {
         }
     }
 
+    fn push_byte(&mut self, val: u8) {
+        let sp_addr = self.sp_reg as usize + 0x100;
+        self.ram[sp_addr] = val;
+        self.sp_reg = self.sp_reg.wrapping_sub(1);
+    }
+
+    fn pop_byte(&mut self) -> u8 {
+        self.sp_reg = self.sp_reg.wrapping_add(1);
+        let sp_addr = self.sp_reg as usize + 0x100;
+        self.ram[sp_addr]
+    }
+
     pub fn load_rom(&mut self, rom: &nes::ROM) {
         if rom.num_prg_banks == 1 {
             self.ram[0x8000..0xc000].copy_from_slice(&rom.prg_rom);
@@ -113,14 +125,28 @@ impl CPU {
                     println!("BPL no branch");
                 }
             }
+            0x18 => {
+                // CLC
+                self.carry = false;
+                self.pc_reg += 1;
+                println!("CLC");
+            }
             0x20 => {
                 // JSR
-                let sp_addr = self.sp_reg as usize + 0x100;
-                self.ram[sp_addr] = ((self.pc_reg+2) >> 8) as u8;
-                self.ram[sp_addr-1] = ((self.pc_reg+2) & 0xff) as u8;
-                self.sp_reg = self.sp_reg.wrapping_sub(2);
+                let ret_addr = self.pc_reg + 2;
+                self.push_byte((ret_addr >> 8) as u8);
+                self.push_byte((ret_addr & 0xff) as u8);
                 self.pc_reg = self.read_word(pc+1);
                 println!("JSR to {:x}", self.pc_reg);
+            }
+            0x25 => {
+                // AND zero page
+                let addr = self.ram[pc+1] as usize;
+                self.acc_reg &= self.ram[addr];
+                self.negative = (self.acc_reg & 128) != 0;
+                self.zero = self.acc_reg == 0;
+                self.pc_reg += 2;
+                println!("AND zp {:x}, result {:x}", self.ram[addr], self.acc_reg);
             }
             0x29 => {
                 // AND immediate
@@ -128,20 +154,78 @@ impl CPU {
                 self.negative = (self.acc_reg & 128) != 0;
                 self.zero = self.acc_reg == 0;
                 self.pc_reg += 2;
-                println!("AND imm {:x}, result {}", self.ram[pc+1], self.acc_reg);
+                println!("AND imm {:x}, result {:x}", self.ram[pc+1], self.acc_reg);
             }
             0x48 => {
                 // PHA
-                let sp_addr = self.sp_reg as usize + 0x100;
-                self.ram[sp_addr] = self.acc_reg;
-                self.sp_reg = self.sp_reg.wrapping_sub(1);
+                let val = self.acc_reg;
+                self.push_byte(val);
                 self.pc_reg += 1;
                 println!("PHA");
+            }
+            0x4a => {
+                // LSR acc
+                self.carry = (self.acc_reg & 1) != 0;
+                self.acc_reg >>= 1;
+                self.negative = (self.acc_reg & 128) != 0;
+                self.zero = self.acc_reg == 0;
+                self.pc_reg += 1;
+                println!("LSR acc, result {:x}", self.acc_reg);
             }
             0x4c => {
                 // JMP
                 self.pc_reg = self.read_word(pc+1);
                 println!("JMP to {:x}", self.pc_reg);
+            }
+            0x60 => {
+                // RTS
+                let ret_addr_lo = self.pop_byte() as u16;
+                let ret_addr_hi = self.pop_byte() as u16;
+                self.pc_reg = ((ret_addr_hi << 8) + ret_addr_lo).wrapping_add(1);
+                println!("RTS to {:x}", self.pc_reg);
+            }
+            0x65 => {
+                // ADC zero page
+                // TODO: decimal flag
+                let addr = self.ram[pc+1] as usize;
+                let mut acc_int = self.acc_reg as i32 + self.ram[addr] as i32;
+                self.acc_reg = self.acc_reg.wrapping_add(self.ram[addr]);
+                if self.carry {
+                    acc_int += 1;
+                    self.acc_reg = self.acc_reg.wrapping_add(1);
+                }
+                if acc_int > 127 || acc_int < -128 {
+                    self.overflow = true;
+                } else {
+                    self.overflow = false;
+                }
+                self.pc_reg += 2;
+                println!("ADC zp at {:x}, result {:x}", addr, self.acc_reg);
+            }
+            0x68 => {
+                // PLA
+                let val = self.acc_reg;
+                self.push_byte(val);
+                self.pc_reg += 1;
+                println!("PHA");
+            }
+            0x69 => {
+                // ADC immediate
+                // TODO: decimal flag
+                let val = self.ram[pc+1];
+                let mut acc_int = self.acc_reg as i32 + val as i32;
+                self.acc_reg = self.acc_reg.wrapping_add(val);
+                if self.carry {
+                    acc_int += 1;
+                    self.acc_reg = self.acc_reg.wrapping_add(1);
+                }
+                if acc_int > 127 || acc_int < -128 {
+                    self.overflow = true;
+                } else {
+                    self.overflow = false;
+                }
+                self.pc_reg += 2;
+                println!("ADC imm {:x}, result {:x}", val, self.acc_reg);
             }
             0x78 => {
                 // SEI
@@ -233,7 +317,24 @@ impl CPU {
                 self.negative = (self.acc_reg & 128) != 0;
                 self.zero = self.acc_reg == 0;
                 self.pc_reg += 2;
-                println!("LDA zp at {:x}, val {}", addr, self.acc_reg);
+                println!("LDA zp at {:x}, val {:x}", addr, self.acc_reg);
+            }
+            0xa6 => {
+                // LDX zero page
+                let addr = self.ram[pc+1] as usize;
+                self.x_reg = self.read_byte(addr);
+                self.negative = (self.x_reg & 128) != 0;
+                self.zero = self.x_reg == 0;
+                self.pc_reg += 2;
+                println!("LDX zp at {:x}, val {:x}", addr, self.x_reg);
+            }
+            0xa8 => {
+                // TAY
+                self.y_reg = self.acc_reg;
+                self.negative = (self.acc_reg & 128) != 0;
+                self.zero = self.acc_reg == 0;
+                self.pc_reg += 1;
+                println!("TAY");
             }
             0xa9 => {
                 // LDA immediate
@@ -243,6 +344,14 @@ impl CPU {
                 self.pc_reg += 2;
                 println!("LDA imm {:x}", self.acc_reg);
             }
+            0xaa => {
+                // TAX
+                self.x_reg = self.acc_reg;
+                self.negative = (self.acc_reg & 128) != 0;
+                self.zero = self.acc_reg == 0;
+                self.pc_reg += 1;
+                println!("TAX");
+            }
             0xad => {
                 // LDA absolute
                 let addr = self.read_word(pc+1) as usize;
@@ -250,7 +359,15 @@ impl CPU {
                 self.negative = (self.acc_reg & 128) != 0;
                 self.zero = self.acc_reg == 0;
                 self.pc_reg += 3;
-                println!("LDA abs at {:x}, val {}", addr, self.acc_reg);
+                println!("LDA abs at {:x}, val {:x}", addr, self.acc_reg);
+            }
+            0xca => {
+                // DEX
+                self.x_reg = self.x_reg.wrapping_sub(1);
+                self.negative = (self.x_reg & 128) != 0;
+                self.zero = self.x_reg == 0;
+                self.pc_reg += 1;
+                println!("DEX new val {:x}", self.x_reg);
             }
             0xc6 => {
                 // DEC zero page
@@ -260,12 +377,22 @@ impl CPU {
                 self.negative = (new_val & 128) != 0;
                 self.zero = new_val == 0;
                 self.pc_reg += 2;
-                println!("DEC zp new val {:x}", new_val);
+                println!("DEC zp new val {:x} at {:x}", new_val, addr);
+            }
+            0xc8 => {
+                // INY
+                self.y_reg = self.y_reg.wrapping_add(1);
+                self.negative = (self.y_reg & 128) != 0;
+                self.zero = self.y_reg == 0;
+                self.pc_reg += 1;
+                println!("INY new val {:x}", self.y_reg);
             }
             0xc9 => {
                 // CMP immediate
                 let val = self.ram[pc+1];
-                // TODO
+                self.carry = self.acc_reg >= val;
+                self.negative = (self.acc_reg & 128) != 0;
+                self.zero = self.acc_reg == val;
                 self.pc_reg += 2;
                 println!("CMP imm {:x}", val);
             }
