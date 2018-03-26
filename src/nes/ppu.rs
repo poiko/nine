@@ -25,10 +25,10 @@ pub struct PPU {
     // SPR-RAM address register
     spr_ram_addr: usize,
 
-    // VRAM address register 1 and 2
-    vram_addr1: u8,
-    vram_addr2: u8,
-    
+    scroll_pos: u8,
+    vram_addr: u8,
+    vram_addr_prev: u8,
+
     ram: Vec<u8>,
     spr_ram: Vec<u8>
 }
@@ -44,11 +44,13 @@ impl PPU {
 
     pub fn read_io_reg(&mut self, reg: usize) -> u8 {
         if reg == 2 {
-            self.vram_addr1 = 0;
-            self.vram_addr2 = 0;
-            self.io_regs[reg]            
-        } else if reg == 7 {
+            self.scroll_pos = 0;
+            self.vram_addr = 0;
             self.io_regs[reg]
+        } else if reg == 7 {
+            let addr = (self.vram_addr_prev as usize) << 8 + self.vram_addr as usize;
+            self.ram[addr]
+            // TODO: increment address?
         } else {
             panic!("Attempt to read write-only I/O register {}", reg);
         }
@@ -76,12 +78,18 @@ impl PPU {
                     self.background_col = (val >> 5) as u32;
                 }
                 5 => {
-                    // VRAM addr reg 1
-                    self.vram_addr1 = val;
+                    // scroll reg
+                    self.scroll_pos = val;
                 }
                 6 => {
-                    // VRAM addr reg 2
-                    self.vram_addr2 = val;
+                    // VRAM addr reg
+                    self.vram_addr_prev = self.vram_addr;
+                    self.vram_addr = val;
+                }
+                7 => {
+                    let addr = ((self.vram_addr_prev as usize) << 8) + self.vram_addr as usize;
+                    self.ram[addr] = val;
+                    // TODO: increment address?
                 }
                 _ => { panic!("Unhandled I/O register {} write", reg); }
             }
