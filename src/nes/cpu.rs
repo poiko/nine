@@ -135,6 +135,28 @@ impl CPU {
         println!("");
     }
 
+    fn get_flags(&self) -> u8 {
+        let mut flags: u8 = 0;
+        if self.carry { flags |= 1; }
+        if self.zero { flags |= 2; }
+        if self.int_disable { flags |= 4; }
+        if self.bcd_mode { flags |= 8; }
+        if self.brk_cmd { flags |= 16; }
+        if self.overflow { flags |= 64; }
+        if self.negative { flags |= 128; }
+        flags
+    }
+
+    fn set_flags(&mut self, flags: u8) {
+        self.carry = flags & 1 != 0;
+        self.zero = flags & 2 != 0;
+        self.int_disable = flags & 4 != 0;
+        self.bcd_mode = flags & 8 != 0;
+        self.brk_cmd = flags & 16 != 0;
+        self.overflow = flags & 64 != 0;
+        self.negative = flags & 128 != 0;
+    }
+
     pub fn load_rom(&mut self, rom: &nes::ROM) {
         if rom.num_prg_banks == 1 {
             self.ram[0x8000..0xc000].copy_from_slice(&rom.prg_rom);
@@ -160,13 +182,39 @@ impl CPU {
         self.cycles_run = 0;
     }
 
+    pub fn run_interrupts(&mut self) {
+        if self.brk_cmd {
+            self.brk_cmd = false;
+
+            let pc_hi = (self.pc_reg >> 8) as u8;
+            let pc_lo = (self.pc_reg & 0xff) as u8;
+            self.push_byte(pc_hi);
+            self.push_byte(pc_lo);
+            let flags = self.get_flags();
+            self.push_byte(flags);
+
+            self.int_disable = true;
+            self.pc_reg = self.read_word(INT_NMI_POS);
+        }
+    }
+
     pub fn run_step(&mut self) {
         let opcode = self.ram[self.pc_reg as usize];
         self.run_instruction(&INSTRUCTIONS[opcode as usize]);
         self.ppu.run_step();
+        self.run_interrupts();
     }
 
     pub fn run_instruction(&mut self, instr: &Instruction) {
+        macro_rules! branch {
+            ($condition: expr, $rel_addr: expr) =>
+                (if $condition {
+                    self.pc_reg = (self.pc_reg as i32 + $rel_addr as i32) as u16;
+                    // TODO: page boundary check
+                    self.cycles_run += 1;
+                })
+        }
+
         let pc = self.pc_reg as usize + 1;
         let addr = match instr.addr_mode {
             AddrMode::Imm | AddrMode::Rel => {
@@ -212,16 +260,33 @@ impl CPU {
         self.pc_reg += instr.bytes as u16;
         self.cycles_run += instr.cycles as u32;
 
+        let mut value_lo: u8 = 0;
+        let mut value_hi: u8 = 0;
         let mut result: u8 = 0;
         match instr.opcode {
             0x00 => {
                 // BRK
-                unimplemented!();
+                self.brk_cmd = true;
             }
             0x01 | 0x05 | 0x09 | 0x0d | 0x11 | 0x15 | 0x19 | 0x1d => {
                 // ORA
-                self.acc_reg |= self.read_byte_mapped(addr);
+                value_lo = self.read_byte_mapped(addr);
+                self.acc_reg |= value_lo;
                 result = self.acc_reg;
+            }
+            0x06 | 0x0e | 0x16 | 0x1e => {
+                // ASL memory
+                value_lo = self.read_byte_mapped(addr);
+                result = value_lo << 1;
+                self.write_byte_mapped(addr, result);
+                self.carry = (value_lo & 128) != 0;
+            }
+            0x0a => {
+                // ASL accumulator
+                value_lo = self.acc_reg;
+                result = value_lo << 1;
+                self.acc_reg = result;
+                self.carry = (value_lo & 128) != 0;
             }
             0x10 => {
                 // BPL
@@ -242,28 +307,44 @@ impl CPU {
                 self.push_byte((ret_addr >> 8) as u8);
                 self.push_byte((ret_addr & 0xff) as u8);
                 self.pc_reg = addr as u16;
+                value_lo = (addr & 0xff) as u8;
+                value_hi = (addr >> 8) as u8;
             }
             0x21 | 0x25 | 0x29 | 0x2d | 0x31 | 0x35 | 0x39 | 0x3d => {
                 // AND
-                self.acc_reg &= self.read_byte_mapped(addr);
+                value_lo = self.read_byte_mapped(addr);
+                self.acc_reg &= value_lo;
                 result = self.acc_reg;
+            }
+            0x38 => {
+                // SEC
+                self.carry = true;
+            }
+            0x40 => {
+                // RTI
+                let flags = self.pop_byte();
+                value_lo = self.pop_byte();
+                value_hi = self.pop_byte();
+                self.set_flags(flags);
+                self.pc_reg = ((value_hi as u16) << 8) | value_lo as u16;
             }
             0x41 | 0x45 | 0x49 | 0x4d | 0x51 | 0x55 | 0x59 | 0x5d => {
                 // EOR
-                self.acc_reg ^= self.read_byte_mapped(addr);
+                value_lo = self.read_byte_mapped(addr);
+                self.acc_reg ^= value_lo;
                 result = self.acc_reg;
             }
             0x46 | 0x4e | 0x56 | 0x5e => {
                 // LSR memory
-                let val = self.read_byte_mapped(addr);
-                self.carry = (val & 1) != 0;
-                self.acc_reg = val >> 1;
+                value_lo = self.read_byte_mapped(addr);
+                self.carry = (value_lo & 1) != 0;
+                self.acc_reg = value_lo >> 1;
                 result = self.acc_reg;
             }
             0x48 => {
                 // PHA
-                let val = self.acc_reg;
-                self.push_byte(val);
+                let value_lo = self.acc_reg;
+                self.push_byte(value_lo);
             }
             0x4a => {
                 // LSR accumulator
@@ -271,9 +352,11 @@ impl CPU {
                 self.acc_reg >>= 1;
                 result = self.acc_reg;
             }
-            0x4c | 0x6c => {
+            0x4c => {
                 // JMP
-                self.pc_reg = self.read_word(addr);
+                self.pc_reg = addr as u16;
+                value_lo = (addr & 0xff) as u8;
+                value_hi = (addr >> 8) as u8;
             }
             0x60 => {
                 // RTS
@@ -313,6 +396,7 @@ impl CPU {
             0x68 => {
                 // PLA
                 self.acc_reg = self.pop_byte();
+                value_lo = self.acc_reg;
             }
             0x6a => {
                 // ROR accumulator
@@ -324,19 +408,25 @@ impl CPU {
                 self.carry = new_carry;
                 result = self.acc_reg;
             }
+            0x6c => {
+                // JMP indirect
+                self.pc_reg = self.read_word_mapped(addr);
+                value_lo = (addr & 0xff) as u8;
+                value_hi = (addr >> 8) as u8;
+            }
             0x78 => {
                 // SEI
                 self.int_disable = true;
             }
             0x81 | 0x85 | 0x8d | 0x91 | 0x95 | 0x99 | 0x9d => {
                 // STA
-                let val = self.acc_reg;
-                self.write_byte_mapped(addr, val);
+                value_lo = self.acc_reg;
+                self.write_byte_mapped(addr, value_lo);
             }
             0x84 | 0x8c | 0x94 => {
                 // STY
-                let val = self.y_reg;
-                self.write_byte_mapped(addr, val);
+                value_lo = self.y_reg;
+                self.write_byte_mapped(addr, value_lo);
             }
             0x88 => {
                 // DEY
@@ -350,8 +440,12 @@ impl CPU {
             }
             0x81 | 0x85 | 0x8d | 0x91 | 0x95 | 0x99 | 0x9d => {
                 // STA
-                let val = self.acc_reg;
-                self.write_byte_mapped(addr, val);
+                value_lo = self.acc_reg;
+                self.write_byte_mapped(addr, value_lo);
+            }
+            0x90 => {
+                // BCC
+                branch!(!self.carry, self.ram[addr] as i8);
             }
             0x98 => {
                 // TYA
@@ -387,6 +481,10 @@ impl CPU {
                 self.x_reg = self.acc_reg;
                 result = self.acc_reg;
             }
+            0xb0 => {
+                // BCS
+                branch!(self.carry, self.ram[addr] as i8);
+            }
             0xc1 | 0xc5 | 0xc9 | 0xcd | 0xd1 | 0xd5 | 0xd9 | 0xdd => {
                 // CMP
                 let val = self.read_byte_mapped(addr);
@@ -412,12 +510,7 @@ impl CPU {
             }
             0xd0 => {
                 // BNE
-                if !self.zero {
-                    let rel_addr = self.ram[addr] as i8;
-                    self.pc_reg = (self.pc_reg as i32 + rel_addr as i32) as u16;
-                    // TODO: page boundary check
-                    self.cycles_run += 1;
-                }
+                branch!(!self.zero, self.ram[addr] as i8);
             }
             0xd8 => {
                 // CLD
@@ -441,12 +534,7 @@ impl CPU {
             }
             0xf0 => {
                 // BEQ
-                if self.zero {
-                    let rel_addr = self.ram[addr] as i8;
-                    self.pc_reg = (self.pc_reg as i32 + rel_addr as i32) as u16;
-                    // TODO: page boundary check
-                    self.cycles_run += 1;
-                }
+                branch!(self.zero, self.ram[addr] as i8);
             }
             _ => {
                 panic!("Unrecognized opcode {:x}", instr.opcode);
@@ -458,8 +546,8 @@ impl CPU {
             self.zero = result == 0;
         }
 
-        println!("{:x}: {} (0x{:x}) {}, result = 0x{:x}", self.pc_reg, instr.name, instr.opcode, instr.addr_mode,
-                 result);
+        println!("{:x}: {} (0x{:x}) {}, value = 0x{:x}{:x}, result = 0x{:x}", pc-1, instr.name, instr.opcode,
+                 instr.addr_mode, value_hi, value_lo, result);
     }
 }
 
@@ -470,21 +558,21 @@ macro_rules! instruction {
 }
 
 const INSTRUCTIONS: [Instruction; 256] = [
-    instruction!("BRK", 0x00, 1, 3, None, false, false),
+    instruction!("BRK", 0x00, 1, 7, None, false, false),
     instruction!("ORA", 0x01, 2, 6, IdxInd, false, true),
     instruction!("ERR", 0x02, 0, 0, None, false, false),
     instruction!("ERR", 0x03, 0, 0, None, false, false),
     instruction!("ERR", 0x04, 0, 0, None, false, false),
     instruction!("ORA", 0x05, 2, 3, ZP, false, true),
-    instruction!("ERR", 0x06, 0, 0, None, false, false),
+    instruction!("ASL", 0x06, 2, 5, ZP, false, true),
     instruction!("ERR", 0x07, 0, 0, None, false, false),
     instruction!("ERR", 0x08, 0, 0, None, false, false),
     instruction!("ORA", 0x09, 2, 2, Imm, false, true),
-    instruction!("ERR", 0x0a, 0, 0, None, false, false),
+    instruction!("ASL", 0x0a, 1, 2, None, false, true),
     instruction!("ERR", 0x0b, 0, 0, None, false, false),
     instruction!("ERR", 0x0c, 0, 0, None, false, false),
     instruction!("ORA", 0x0d, 3, 4, Abs, false, true),
-    instruction!("ERR", 0x0e, 0, 0, None, false, false),
+    instruction!("ASL", 0x0e, 3, 6, Abs, false, true),
     instruction!("ERR", 0x0f, 0, 0, None, false, false),
     instruction!("BPL", 0x10, 2, 2, Rel, false, false),
     instruction!("ORA", 0x11, 2, 5, IndIdx, true, true),
@@ -500,7 +588,7 @@ const INSTRUCTIONS: [Instruction; 256] = [
     instruction!("ERR", 0x1b, 0, 0, None, false, false),
     instruction!("ERR", 0x1c, 0, 0, None, false, false),
     instruction!("ORA", 0x1d, 3, 4, IdxAbsX, true, true),
-    instruction!("ERR", 0x1e, 0, 0, None, false, false),
+    instruction!("ASL", 0x1e, 3, 7, IdxAbsX, false, true),
     instruction!("ERR", 0x1f, 0, 0, None, false, false),
     instruction!("JSR", 0x20, 3, 6, Abs, false, false),
     instruction!("AND", 0x21, 2, 6, IdxInd, false, true),
@@ -526,7 +614,7 @@ const INSTRUCTIONS: [Instruction; 256] = [
     instruction!("AND", 0x35, 2, 4, IdxZPX, false, true),
     instruction!("ERR", 0x36, 0, 0, None, false, false),
     instruction!("ERR", 0x37, 0, 0, None, false, false),
-    instruction!("ERR", 0x38, 0, 0, None, false, false),
+    instruction!("SEC", 0x38, 1, 2, None, false, false),
     instruction!("AND", 0x39, 3, 4, IdxAbsY, true, true),
     instruction!("ERR", 0x3a, 0, 0, None, false, false),
     instruction!("ERR", 0x3b, 0, 0, None, false, false),
@@ -534,7 +622,7 @@ const INSTRUCTIONS: [Instruction; 256] = [
     instruction!("AND", 0x3d, 3, 4, IdxAbsX, true, true),
     instruction!("ERR", 0x3e, 0, 0, None, false, false),
     instruction!("ERR", 0x3f, 0, 0, None, false, false),
-    instruction!("ERR", 0x40, 0, 0, None, false, false),
+    instruction!("RTI", 0x40, 1, 6, None, false, false),
     instruction!("EOR", 0x41, 2, 6, IdxInd, false, true),
     instruction!("ERR", 0x42, 0, 0, None, false, false),
     instruction!("ERR", 0x43, 0, 0, None, false, false),
@@ -614,7 +702,7 @@ const INSTRUCTIONS: [Instruction; 256] = [
     instruction!("STA", 0x8d, 3, 4, Abs, false, false),
     instruction!("ERR", 0x8e, 0, 0, None, false, false),
     instruction!("ERR", 0x8f, 0, 0, None, false, false),
-    instruction!("ERR", 0x90, 0, 0, None, false, false),
+    instruction!("BCC", 0x90, 2, 2, Rel, true, false),
     instruction!("STA", 0x91, 2, 6, IndIdx, false, false),
     instruction!("ERR", 0x92, 0, 0, None, false, false),
     instruction!("ERR", 0x93, 0, 0, None, false, false),
@@ -646,7 +734,7 @@ const INSTRUCTIONS: [Instruction; 256] = [
     instruction!("LDA", 0xad, 3, 4, Abs, false, true),
     instruction!("LDX", 0xae, 3, 4, Abs, false, true),
     instruction!("ERR", 0xaf, 0, 0, None, false, false),
-    instruction!("ERR", 0xb0, 0, 0, None, false, false),
+    instruction!("BCS", 0xb0, 2, 2, Rel, true, false),
     instruction!("LDA", 0xb1, 2, 5, IndIdx, true, true),
     instruction!("ERR", 0xb2, 0, 0, None, false, false),
     instruction!("ERR", 0xb3, 0, 0, None, false, false),
